@@ -1,0 +1,38 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test, type-check, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Generated animation caches, frames, and renders
+/cache/
+/artifacts/
+/renders/
+/*.mp4
+/examples/*.mp4
+*.frames
+*.objects
