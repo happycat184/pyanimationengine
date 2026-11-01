@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from threading import local
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -302,11 +303,20 @@ class FrameGenerator:
         dst = buffer.pixels[y0:y1, x0:x1].astype(np.float32)
         buffer.pixels[y0:y1, x0:x1] = np.clip(src * alpha + dst * (1 - alpha), 0, 255).astype(np.uint8)
 
-    def generate(self, objects: list[RenderObject], buffer: FrameBuffer | None = None) -> FrameBuffer:
+    def generate(
+        self,
+        objects: list[RenderObject],
+        buffer: FrameBuffer | None = None,
+        *,
+        presorted: bool = False,
+    ) -> FrameBuffer:
         c = self.config
         if buffer is None:
             buffer = FrameBuffer(c.raster_width, c.raster_height, self.background)
-        for obj in sorted(objects, key=lambda item: (item.z_index, item.insertion_order)):
+        ordered_objects = objects if presorted else sorted(
+            objects, key=lambda item: (item.z_index, item.insertion_order)
+        )
+        for obj in ordered_objects:
             if obj.fill_opacity <= 0 and obj.stroke_opacity <= 0 and obj.text is None:
                 continue
             if obj.text is not None:
@@ -367,7 +377,7 @@ class Renderer:
         gpu = self.gpu_generator if use_gpu else None
         objects = sorted(objects, key=lambda obj: (obj.z_index, obj.insertion_order))
         if not any(obj.mesh is not None for obj in objects):
-            return (gpu or generator).generate(objects)
+            return (gpu or generator).generate(objects, presorted=True)
         frame = FrameBuffer(self.config.raster_width, self.config.raster_height, color_rgb(self.config.background_color))
         for _, layer in groupby(objects, key=lambda obj: obj.z_index):
             layer = list(layer)
@@ -376,7 +386,7 @@ class Renderer:
             if meshes:
                 frame = self.renderer3d.generate(meshes, frame, gpu=gpu)
             if overlays:
-                frame = (gpu or generator).generate(overlays, frame)
+                frame = (gpu or generator).generate(overlays, frame, presorted=True)
         return frame
 
     def _generate(self, objects, generator=None, use_gpu=True):
@@ -407,9 +417,16 @@ class Renderer:
                 progress.update("3D In Rendering", frame_index, total_frames, f"meshes={meshes}")
         return frame
 
-    def render_cache(self, object_cache: str | Path, frame_cache: str | Path, progress: ProgressReporter | None = None) -> int:
-        """Render cached frames in parallel, preserving their original sequence."""
+    def render_cache(
+        self,
+        object_cache: str | Path,
+        frame_cache: str | Path | None,
+        progress: ProgressReporter | None = None,
+        on_frame=None,
+    ) -> int:
+        """Render cached frames in order, optionally sending each frame to a viewer."""
         from .object_cache import FrameSequenceWriter, ObjectCacheReader
+        from contextlib import nullcontext
 
         frame_count = 0
         with ObjectCacheReader(object_cache) as reader:
@@ -429,7 +446,12 @@ class Renderer:
                     matches = cached == value
                 if not matches:
                     raise ValueError(f".objects cache setting mismatch for {name}")
-            with FrameSequenceWriter(frame_cache) as frames:
+            frame_context = (
+                FrameSequenceWriter(frame_cache)
+                if frame_cache is not None
+                else nullcontext(None)
+            )
+            with frame_context as frames:
                 worker_count = self.config.effective_workers
 
                 def calculating(frame_index, objects):
@@ -443,8 +465,11 @@ class Renderer:
 
                 def write_result(frame, has_3d):
                     nonlocal frame_count
-                    frames.write(frame.pixels)
+                    if frames is not None:
+                        frames.write(frame.pixels)
                     frame_count += 1
+                    if on_frame is not None and on_frame(frame) is False:
+                        raise OnlineWindowClosed
                     if progress is not None:
                         info = f"pixels={self.config.width}x{self.config.height} device={'GPU' if self.gpu_generator else 'CPU'}"
                         progress.update("In Rendering", frame_count, reader.frame_count, info)
@@ -555,36 +580,155 @@ class Drawer:
             raise RuntimeError(f"FFmpeg failed ({code}): {error.strip()}")
 
 
+class OnlineWindowClosed(Exception):
+    """Raised when the user closes the live preview to stop rendering."""
+
+
+class OnlineDrawer:
+    """Present rendered RGB frames in a Tk window without opening FFmpeg."""
+
+    def __init__(self, config: RenderConfig, title: str = "PyAnimation live render"):
+        self.config = config
+        self.title = title
+        self.root = None
+        self.label = None
+        self.photo = None
+        self.running = False
+        self.frame_count = 0
+        self.next_frame_time = 0.0
+        self.frame_interval = 1.0 / config.fps
+
+    def open(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except ImportError as exc:
+            raise RuntimeError("Online rendering needs Tkinter; install a Python build with Tcl/Tk support.") from exc
+
+        try:
+            self.root = tk.Tk()
+            self.root.title(self.title)
+            self.root.configure(background="#10131c")
+            self.root.protocol("WM_DELETE_WINDOW", self.close)
+            self.root.bind("<Escape>", lambda _event: self.close())
+            self.label = ttk.Label(self.root)
+            self.label.pack(fill="both", expand=True)
+            self.root.update_idletasks()
+            self.running = True
+            self.next_frame_time = time.perf_counter()
+            print(
+                f"[INFO Online] window=open size={self.config.width}x{self.config.height} "
+                f"fps={self.config.fps}",
+                flush=True,
+            )
+            self.root.update()
+        except Exception as exc:
+            self.close()
+            raise RuntimeError(f"Could not open the online render window: {exc}") from exc
+
+    def poll(self) -> bool:
+        if not self.running or self.root is None:
+            return False
+        try:
+            self.root.update()
+            return self.running
+        except Exception:
+            self.running = False
+            return False
+
+    def write(self, frame: FrameBuffer) -> bool:
+        if not self.poll():
+            return False
+
+        deadline = max(self.next_frame_time, time.perf_counter())
+        while self.running:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            if not self.poll():
+                return False
+            time.sleep(min(remaining, 0.01))
+
+        from PIL import Image, ImageTk
+
+        image = Image.fromarray(frame.pixels, mode="RGB")
+        if image.size != (self.config.width, self.config.height):
+            image = image.resize((self.config.width, self.config.height), Image.Resampling.LANCZOS)
+        screen_width = max(320, self.root.winfo_screenwidth() - 64)
+        screen_height = max(240, self.root.winfo_screenheight() - 112)
+        image.thumbnail((screen_width, screen_height), Image.Resampling.LANCZOS)
+        self.photo = ImageTk.PhotoImage(image, master=self.root)
+        self.label.configure(image=self.photo)
+        self.frame_count += 1
+        self.next_frame_time = max(deadline, time.perf_counter()) + self.frame_interval
+        return self.poll()
+
+    def close(self) -> None:
+        was_running = self.running
+        self.running = False
+        if self.root is not None:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            self.root = None
+        if was_running:
+            print(f"[INFO Online] window=closed frames={self.frame_count}", flush=True)
+
+    def wait_until_closed(self) -> None:
+        """Keep the last frame visible until the user closes the window."""
+        while self.poll():
+            time.sleep(0.025)
+
+
 def render_objects_cache(
     object_cache: str | Path,
-    output_file: str | Path,
+    output_file: str | Path | None = None,
     config: RenderConfig | None = None,
-) -> Path:
-    """Render a portable ``.objects`` cache without importing its source scene."""
+    *,
+    online: bool = False,
+) -> Path | None:
+    """Render a cache to MP4 or show it frame-by-frame without writing a video."""
     from .object_cache import ObjectCacheReader, render_config_from_cache
 
     object_cache = Path(object_cache)
-    output = Path(output_file)
+    output = Path(output_file) if output_file is not None else None
+    if not online and output is None:
+        raise ValueError("output_file is required unless online=True")
     if config is None:
         config = render_config_from_cache(object_cache)
     with ObjectCacheReader(object_cache) as reader:
         expected_frames = reader.frame_count
 
-    with tempfile.NamedTemporaryFile(prefix="pyanimation-", suffix=".frames", delete=False) as temp_file:
-        frame_path = Path(temp_file.name)
+    online_drawer = OnlineDrawer(config, title=f"{object_cache.name} — live render") if online else None
+    frame_path = None
     try:
         renderer = Renderer(config)
         progress = ProgressReporter(expected_frames)
-        rendered_frames = renderer.render_cache(object_cache, frame_path, progress)
+        if online_drawer is not None:
+            online_drawer.open()
+            rendered_frames = renderer.render_cache(object_cache, None, progress, on_frame=online_drawer.write)
+        else:
+            with tempfile.NamedTemporaryFile(prefix="pyanimation-", suffix=".frames", delete=False) as temp_file:
+                frame_path = Path(temp_file.name)
+            rendered_frames = renderer.render_cache(object_cache, frame_path, progress)
         if rendered_frames != expected_frames:
             raise RuntimeError(f"frame count mismatch: expected {expected_frames}, got {rendered_frames}")
-        Drawer(output, config).write_frames(frame_path, rendered_frames, progress)
+        if online_drawer is not None:
+            online_drawer.wait_until_closed()
+        else:
+            Drawer(output, config).write_frames(frame_path, rendered_frames, progress)
+    except OnlineWindowClosed:
+        print("[INFO Online] rendering=stopped by user", flush=True)
     finally:
+        if online_drawer is not None:
+            online_drawer.close()
         try:
-            frame_path.unlink()
+            if frame_path is not None:
+                frame_path.unlink()
         except FileNotFoundError:
             pass
-    return output
+    return None if online else output
 
 
 def describe_pipeline() -> str:

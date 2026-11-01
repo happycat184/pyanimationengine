@@ -1,5 +1,6 @@
 """A short, editable 3D scene. Run with: python examples/hello_3d.py"""
 from pathlib import Path
+import argparse
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -26,4 +27,13 @@ class Hello3D(ThreeDScene):
 
 
 if __name__ == "__main__":
-    Hello3D().render("hello_3d.mp4")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--online", action="store_true", help="preview frames live without writing an MP4")
+    parser.add_argument("-o", "--output", help="output MP4 path")
+    args = parser.parse_args()
+    if args.online and args.output:
+        parser.error("--output cannot be used with --online")
+    if args.online:
+        Hello3D().render_online()
+    else:
+        Hello3D().render(args.output or "hello_3d.mp4")

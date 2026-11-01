@@ -34,11 +34,12 @@ def _load_scene(source: Path, name: str | None):
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Render a Python animation scene to MP4")
+    parser = argparse.ArgumentParser(description="Render a Python animation scene to MP4 or a live window")
     parser.add_argument("source", nargs="?", type=Path, help="Python file defining a Scene subclass")
     parser.add_argument("scene", nargs="?", help="Scene class name (optional when the file has one scene)")
     parser.add_argument("-o", "--output", type=Path, help="output MP4 path")
     parser.add_argument("--objects-cache", type=Path, help="render a portable .objects cache without the Python scene")
+    parser.add_argument("--online", action="store_true", help="show frames live in a window; do not create an MP4")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
@@ -51,6 +52,8 @@ def main(argv=None) -> int:
     parser.add_argument("--crf", type=int, default=18)
     parser.add_argument("--preset", default="medium")
     args = parser.parse_args(argv)
+    if args.online and args.output:
+        parser.error("--output cannot be used with --online; no MP4 is written")
 
     if args.objects_cache:
         if args.source or args.scene:
@@ -58,9 +61,13 @@ def main(argv=None) -> int:
         config = render_config_from_cache(args.objects_cache, crf=args.crf, preset=args.preset)
         config.workers = args.workers
         config.device = args.device
-        output = args.output or args.objects_cache.with_suffix(".mp4")
-        result = render_objects_cache(args.objects_cache, output, config)
-        print(f"Rendered cache: {result.resolve()}")
+        if args.online:
+            render_objects_cache(args.objects_cache, config=config, online=True)
+            print("Online cache preview finished")
+        else:
+            output = args.output or args.objects_cache.with_suffix(".mp4")
+            result = render_objects_cache(args.objects_cache, output, config)
+            print(f"Rendered cache: {result.resolve()}")
         return 0
     if args.source is None:
         parser.error("provide a Python scene source or --objects-cache")
@@ -69,8 +76,11 @@ def main(argv=None) -> int:
     scene_class = _load_scene(args.source.resolve(), args.scene)
     scene = scene_class(config=config)
     output = args.output or Path(f"{scene_class.__name__.lower()}.mp4")
-    result = scene.render(output)
-    print(f"Rendered: {result.resolve()}")
+    result = scene.render(output, online=args.online)
+    if args.online:
+        print("Online preview finished; no MP4 was written")
+    else:
+        print(f"Rendered: {result.resolve()}")
     return 0
 
 

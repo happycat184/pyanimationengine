@@ -11,7 +11,7 @@ from .config import RenderConfig
 from .mobject import Mobject, VGroup
 from .geometry3d import Camera3D
 from .object_cache import ObjectCacheWriter
-from .pipeline import Converter, Drawer, ProgressReporter, Renderer
+from .pipeline import Converter, Drawer, OnlineDrawer, OnlineWindowClosed, ProgressReporter, Renderer
 
 
 class Scene:
@@ -24,6 +24,7 @@ class Scene:
         self._commands: list[tuple] = []
         self._active: list[Mobject] = []
         self._drawer: Drawer | None = None
+        self._online_drawer: OnlineDrawer | None = None
         self._converter: Converter | None = None
         self._cache_writer: ObjectCacheWriter | None = None
         self._conversion_executor: ThreadPoolExecutor | None = None
@@ -120,6 +121,8 @@ class Scene:
             if meshes:
                 self._progress.update("3D Converting", frame_index, self._total_frames,
                                       f"meshes={len(meshes)} triangles={sum(len(m.faces) for m in meshes)} cache={cache_name}")
+        if self._online_drawer is not None and not self._online_drawer.poll():
+            raise OnlineWindowClosed
         self._has_frame = True
 
     def _estimate_total_frames(self) -> int:
@@ -202,12 +205,19 @@ class Scene:
         for _ in range(frames):
             self._emit()
 
-    def render(self, output_file: str | Path | None = None, config: RenderConfig | None = None) -> Path:
+    def render(
+        self,
+        output_file: str | Path | None = None,
+        config: RenderConfig | None = None,
+        *,
+        online: bool = False,
+    ) -> Path | None:
+        """Render an MP4, or show each rendered frame in a live window."""
         if self._rendered:
             raise RuntimeError("a Scene instance can only be rendered once")
         if config is not None:
             self.config = config
-        output = Path(output_file or f"{type(self).__name__.lower()}.mp4")
+        output = None if online else Path(output_file or f"{type(self).__name__.lower()}.mp4")
         objects_path = None
         frame_path = None
         try:
@@ -226,8 +236,12 @@ class Scene:
             cache_dir = Path("cache")
             cache_dir.mkdir(parents=True, exist_ok=True)
             objects_path = cache_dir / f"{script_stem}.objects"
-            with tempfile.NamedTemporaryFile(prefix=f"{script_stem}.", suffix=".frames", dir=cache_dir, delete=False) as temp_frames:
-                frame_path = Path(temp_frames.name)
+            if online:
+                self._online_drawer = OnlineDrawer(self.config, title=f"{script_stem} — live render")
+                self._online_drawer.open()
+            else:
+                with tempfile.NamedTemporaryFile(prefix=f"{script_stem}.", suffix=".frames", dir=cache_dir, delete=False) as temp_frames:
+                    frame_path = Path(temp_frames.name)
 
             self._converter = Converter(self.config, initial_camera)
             if self.config.effective_workers > 1:
@@ -261,11 +275,21 @@ class Scene:
                 self._conversion_executor.shutdown(wait=True)
                 self._conversion_executor = None
 
-            rendered_count = self._renderer.render_cache(objects_path, frame_path, self._progress)
+            rendered_count = self._renderer.render_cache(
+                objects_path,
+                frame_path,
+                self._progress,
+                on_frame=self._online_drawer.write if self._online_drawer is not None else None,
+            )
             if rendered_count != self._total_frames:
                 raise RuntimeError(f"frame count mismatch: expected {self._total_frames}, got {rendered_count}")
-            self._drawer = Drawer(output, self.config)
-            self._drawer.write_frames(frame_path, rendered_count, self._progress)
+            if self._online_drawer is not None:
+                self._online_drawer.wait_until_closed()
+            else:
+                self._drawer = Drawer(output, self.config)
+                self._drawer.write_frames(frame_path, rendered_count, self._progress)
+        except OnlineWindowClosed:
+            print("[INFO Online] rendering=stopped by user", flush=True)
         finally:
             if self._conversion_executor is not None:
                 self._conversion_executor.shutdown(wait=True)
@@ -275,13 +299,20 @@ class Scene:
                 self._cache_writer = None
             if self._drawer is not None and self._drawer.process is not None:
                 self._drawer.close()
+            if self._online_drawer is not None:
+                self._online_drawer.close()
+                self._online_drawer = None
             if frame_path is not None:
                 try:
                     frame_path.unlink()
                 except FileNotFoundError:
                     pass
             self._rendered = True
-        return output
+        return None if online else output
+
+    def render_online(self, config: RenderConfig | None = None) -> None:
+        """Render to a live preview window and do not create an MP4."""
+        self.render(config=config, online=True)
 
 
 class MovingCameraScene(Scene):

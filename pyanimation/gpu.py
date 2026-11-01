@@ -220,6 +220,7 @@ class GPUFrameGenerator:
         object_words: list[int] = []
         path_words: list[int] = []
         point_arrays: list[np.ndarray] = []
+        point_count = 0
         bitmap_bytes = bytearray()
         bitmap_word_count = 0
 
@@ -261,10 +262,11 @@ class GPUFrameGenerator:
                         closed = False
                     if len(points) == 0:
                         continue
-                    point_start = sum(len(p) for p in point_arrays) + sum(len(p) for p, _ in clipped_paths)
+                    point_start = point_count
                     clipped_paths.append((points, closed))
                     all_points.append(points)
                     path_words.extend((point_start, len(points), int(bool(closed)), 0))
+                    point_count += len(points)
                     path_count += 1
                 if clipped_paths:
                     for path_points, _ in clipped_paths:
@@ -324,10 +326,17 @@ class GPUFrameGenerator:
             np.frombuffer(bitmap_bytes, dtype="<u4").copy(),
         )
 
-    def generate(self, objects: list[RenderObject], initial_frame: FrameBuffer | None = None) -> FrameBuffer:
+    def generate(
+        self,
+        objects: list[RenderObject],
+        initial_frame: FrameBuffer | None = None,
+        *,
+        presorted: bool = False,
+    ) -> FrameBuffer:
         wgpu = self._wgpu
         c = self.config
-        objects = sorted(objects, key=lambda obj: (obj.z_index, obj.insertion_order))
+        if not presorted:
+            objects = sorted(objects, key=lambda obj: (obj.z_index, obj.insertion_order))
         packed_objects, packed_paths, packed_points, packed_bitmaps = self._pack_frame(objects)
         background = _pack_rgb(color_rgb(c.background_color))
         params = np.asarray([c.raster_width, c.raster_height, len(objects), background, int(initial_frame is not None)], dtype="<u4")

@@ -78,8 +78,11 @@ if __name__ == "__main__":
     parser.add_argument("--antialias", type=int, default=1)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--device", choices=("auto", "gpu", "cpu"), default="auto")
-    parser.add_argument("-o", "--output", default="three_d.mp4")
+    parser.add_argument("--online", action="store_true", help="preview frames live without writing an MP4")
+    parser.add_argument("-o", "--output")
     args = parser.parse_args()
     config = RenderConfig(width=args.width, height=args.height, fps=args.fps,
                           antialias=args.antialias, workers=args.workers, device=args.device)
-    ThreeDGallery(config).render(args.output)
+    if args.online and args.output:
+        parser.error("--output cannot be used with --online")
+    ThreeDGallery(config).render(args.output or "three_d.mp4", online=args.online)

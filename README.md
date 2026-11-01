@@ -98,12 +98,14 @@ Solids().render("solids.mp4")
 
 ```bash
 python examples/hello_3d.py
+python examples/hello_3d.py --online
 ```
 
 完整示例包含六种几何体、绕不同轴旋转、遮挡与固定的二维标注：
 
 ```bash
 python examples/three_d.py
+python examples/three_d.py --online
 python examples/three_d.py --device gpu --width 1920 --height 1080 --fps 60 --antialias 2
 python examples/three_d.py --device cpu --workers 16 -o three_d_cpu.mp4
 ```
@@ -114,6 +116,16 @@ python examples/three_d.py --device cpu --workers 16 -o three_d_cpu.mp4
 pyanimation examples/three_d.py ThreeDGallery -o three_d.mp4 --device auto
 pyanimation --objects-cache cache/three_d.objects -o three_d_replay.mp4
 ```
+
+加上 `--online` 可在窗口中按渲染顺序逐帧预览。该模式直接把完成的帧交给窗口，不创建临时帧文件或 MP4；关闭窗口会停止渲染，渲染结束后窗口会停留在最后一帧。它适用于场景脚本和已有 `.objects` 缓存：
+
+```bash
+pyanimation examples/three_d.py ThreeDGallery --online
+pyanimation examples/three_d.py ThreeDGallery --online --device gpu --width 1280 --height 720
+pyanimation --objects-cache cache/three_d.objects --online
+```
+
+Python API 对应 `scene.render(online=True)` 或 `scene.render_online()`。预览使用 Python 自带的 Tkinter；如果提示 Tkinter 不可用，请安装带 Tcl/Tk 的 Python。
 
 三维对象：`Cube`、`Cuboid`、`Sphere`、`Cylinder`、`Cone`、`Torus`、`Plane`、`Tetrahedron`、`Octahedron`、`Line3D`、`ThreeDAxes`；`Mesh3D(vertices, faces)` 接受三角网格，`Polyhedron(vertices, faces)` 对凸多边形面作扇形三角化，`Surface(function, u_range, v_range, resolution)` 采样参数曲面。用 `Group3D(a, b, ...).arrange_in_grid(columns=3)` 整理一组模型；`self.play(Create(group))` 会展开到组内模型，`group.animate.rotate(angle, axis=...)` 则能作为一个动画整体旋转。
 

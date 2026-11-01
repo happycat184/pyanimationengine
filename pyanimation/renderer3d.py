@@ -48,7 +48,7 @@ class Renderer3D:
             if mesh is None or obj.fill_opacity <= 0 or obj.reveal <= 0:
                 continue
             face_count = min(len(mesh.faces), int(math.ceil(len(mesh.faces) * obj.reveal)))
-            vertices = np.asarray(mesh.vertices, dtype=np.float64)
+            vertices = np.asarray(mesh.vertices, dtype=np.float32)
             triangles = vertices[mesh.faces[:face_count]]
             if mesh.perspective:
                 # A point survives the left/right plane when +/-x + z*sx >= 0.
@@ -73,27 +73,47 @@ class Renderer3D:
                     (0, 1, 0, sy),
                     (0, -1, 0, sy),
                 ]
-            planes = np.asarray(planes)
+            planes = np.asarray(planes, dtype=np.float32)
             distances = triangles @ planes[:, :3].T + planes[:, 3]
             outside = (distances < 0).all(axis=1).any(axis=1)
-            inside = (distances >= 0).all(axis=(1,2))
-            clipped, colors = [], []
-            for i in np.flatnonzero(~outside):
-                if inside[i]:
-                    clipped.append(triangles[i])
-                    colors.append(mesh.colors[i])
-                else:
-                    polygon = list(triangles[i])
-                    for plane in planes:
-                        polygon = _clip_polygon(polygon, plane)
-                        if len(polygon) < 3:
-                            break
-                    for j in range(1, len(polygon) - 1):
-                        clipped.append((polygon[0], polygon[j], polygon[j + 1]))
-                        colors.append(mesh.colors[i])
-            if not clipped:
+            inside = (distances >= 0).all(axis=(1, 2))
+
+            # Keep fully visible faces on a vectorized path. Only triangles
+            # crossing the frustum require the slower polygon clipper.
+            direct_faces = np.flatnonzero(inside)
+            boundary_faces = np.flatnonzero(~outside & ~inside)
+            triangle_parts = [triangles[direct_faces]]
+            color_parts = [mesh.colors[direct_faces]]
+            order_parts = [direct_faces]
+            clipped_triangles = []
+            clipped_colors = []
+            clipped_order = []
+            for face_index in boundary_faces:
+                polygon = list(triangles[face_index])
+                for plane in planes:
+                    polygon = _clip_polygon(polygon, plane)
+                    if len(polygon) < 3:
+                        break
+                for corner in range(1, len(polygon) - 1):
+                    clipped_triangles.append((polygon[0], polygon[corner], polygon[corner + 1]))
+                    clipped_colors.append(mesh.colors[face_index])
+                    clipped_order.append(face_index)
+
+            has_clipped_faces = bool(clipped_triangles)
+            if has_clipped_faces:
+                triangle_parts.append(np.asarray(clipped_triangles, dtype=np.float32))
+                color_parts.append(np.asarray(clipped_colors, dtype=np.uint8))
+                order_parts.append(np.asarray(clipped_order, dtype=np.int64))
+            if not any(len(part) for part in triangle_parts):
                 continue
-            xyz = np.asarray(clipped)
+
+            xyz = np.concatenate(triangle_parts)
+            colors = np.concatenate(color_parts)
+            if has_clipped_faces:
+                face_order = np.concatenate(order_parts)
+                stable_order = np.argsort(face_order, kind="stable")
+                xyz = xyz[stable_order]
+                colors = colors[stable_order]
             projected = np.zeros((len(xyz), 4, 4), dtype=np.float32)
             multiplier = c.pixels_per_unit * (mesh.focal_length / xyz[:,:,2] if mesh.perspective else 1.0)
             projected[:,:3,0] = half_w + xyz[:,:,0] * multiplier
@@ -101,7 +121,7 @@ class Renderer3D:
             projected[:,:3,2] = 1.0/xyz[:,:,2] if mesh.perspective else -xyz[:,:,2]
             # Fixed subpixel coordinates make shared edge ownership repeatable.
             projected[:,:3,:2] = np.round(projected[:,:3,:2] * 256) / 256
-            projected[:,3,:3] = colors
+            projected[:, 3, :3] = colors
             projected[:,3,3] = obj.fill_opacity
             a, b, d = projected[:,0], projected[:,1], projected[:,2]
             areas = (b[:,0]-a[:,0])*(d[:,1]-a[:,1]) - (b[:,1]-a[:,1])*(d[:,0]-a[:,0])
@@ -112,12 +132,19 @@ class Renderer3D:
         columns = (c.raster_width + TILE_SIZE - 1) // TILE_SIZE
         rows = (c.raster_height + TILE_SIZE - 1) // TILE_SIZE
         bins = [[] for _ in range(columns * rows)]
-        for index, triangle in enumerate(triangles):
-            bounds_min = np.floor(triangle[:3, :2].min(axis=0) / TILE_SIZE).astype(int)
-            bounds_max = np.floor(triangle[:3, :2].max(axis=0) / TILE_SIZE).astype(int)
-            for y in range(max(0, bounds_min[1]), min(rows - 1, bounds_max[1]) + 1):
-                for x in range(max(0, bounds_min[0]), min(columns - 1, bounds_max[0]) + 1):
-                    bins[y * columns + x].append(index)
+        if len(triangles):
+            screen_points = triangles[:, :3, :2]
+            tile_min = np.floor(screen_points.min(axis=1) / TILE_SIZE).astype(np.int32)
+            tile_max = np.floor(screen_points.max(axis=1) / TILE_SIZE).astype(np.int32)
+            tile_min[:, 0] = np.clip(tile_min[:, 0], 0, columns - 1)
+            tile_min[:, 1] = np.clip(tile_min[:, 1], 0, rows - 1)
+            tile_max[:, 0] = np.clip(tile_max[:, 0], 0, columns - 1)
+            tile_max[:, 1] = np.clip(tile_max[:, 1], 0, rows - 1)
+            for index, ((min_x, min_y), (max_x, max_y)) in enumerate(zip(tile_min, tile_max)):
+                for tile_y in range(min_y, max_y + 1):
+                    row_start = tile_y * columns
+                    for tile_x in range(min_x, max_x + 1):
+                        bins[row_start + tile_x].append(index)
         return triangles, bins, columns
 
     @staticmethod
@@ -262,25 +289,69 @@ fn render3d(@builtin(global_invocation_id) gid: vec3<u32>) {
         if depth > nearest { nearest=depth; color=material.rgb; }
     }
     if params[3] != 0u {
-        // Depth peeling in ascending reciprocal depth; no fixed layer limit.
-        var previous = -1e30;
-        var previous_id = 0u;
-        for (var layer=first; layer<end; layer=layer+1u) {
-            var next_depth = 1e30;
-            var next_id = 0xffffffffu;
-            for (var k=first; k<end; k=k+1u) {
-                let id = indices[k];
-                let material = triangles[id*4u+3u];
-                if material.a >= 1.0 { continue; }
-                let depth = depth_at(id,p);
-                if depth <= -1e30 || depth < nearest { continue; }
-                if depth < previous || (depth == previous && id <= previous_id) { continue; }
-                if depth < next_depth || (depth == next_depth && id < next_id) { next_depth=depth; next_id=id; }
+        // Most pixels contain only a few transparent layers. Sort those in
+        // one scan; fall back to unbounded depth peeling for dense pixels.
+        var sorted_depths: array<f32, 8>;
+        var sorted_indices: array<u32, 8>;
+        var sorted_count = 0u;
+        var overflow = false;
+        for (var k=first; k<end; k=k+1u) {
+            let id = indices[k];
+            let material = triangles[id*4u+3u];
+            if material.a >= 1.0 { continue; }
+            let depth = depth_at(id,p);
+            if depth <= -1e30 || depth < nearest { continue; }
+            if sorted_count == 8u {
+                overflow = true;
+                break;
             }
-            if next_id == 0xffffffffu { break; }
-            let material = triangles[next_id*4u+3u];
-            color = material.rgb*material.a+color*(1.0-material.a);
-            previous=next_depth; previous_id=next_id;
+
+            var insert_at = sorted_count;
+            while insert_at > 0u {
+                let previous_id = sorted_indices[insert_at-1u];
+                let previous_depth = sorted_depths[insert_at-1u];
+                if depth > previous_depth || (depth == previous_depth && id >= previous_id) {
+                    break;
+                }
+                sorted_indices[insert_at] = previous_id;
+                sorted_depths[insert_at] = previous_depth;
+                insert_at = insert_at - 1u;
+            }
+            sorted_indices[insert_at] = id;
+            sorted_depths[insert_at] = depth;
+            sorted_count = sorted_count + 1u;
+        }
+
+        if overflow {
+            // Ascending reciprocal depth is back-to-front for both projections.
+            var previous = -1e30;
+            var previous_id = 0u;
+            for (var layer=first; layer<end; layer=layer+1u) {
+                var next_depth = 1e30;
+                var next_id = 0xffffffffu;
+                for (var k=first; k<end; k=k+1u) {
+                    let id = indices[k];
+                    let material = triangles[id*4u+3u];
+                    if material.a >= 1.0 { continue; }
+                    let depth = depth_at(id,p);
+                    if depth <= -1e30 || depth < nearest { continue; }
+                    if depth < previous || (depth == previous && id <= previous_id) { continue; }
+                    if depth < next_depth || (depth == next_depth && id < next_id) {
+                        next_depth = depth;
+                        next_id = id;
+                    }
+                }
+                if next_id == 0xffffffffu { break; }
+                let material = triangles[next_id*4u+3u];
+                color = material.rgb*material.a+color*(1.0-material.a);
+                previous = next_depth;
+                previous_id = next_id;
+            }
+        } else {
+            for (var layer=0u; layer<sorted_count; layer=layer+1u) {
+                let material = triangles[sorted_indices[layer]*4u+3u];
+                color = material.rgb*material.a+color*(1.0-material.a);
+            }
         }
     }
     let rgb = vec3<u32>(clamp(color,vec3<f32>(0.0),vec3<f32>(255.0)));

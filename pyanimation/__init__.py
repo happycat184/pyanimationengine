@@ -67,7 +67,7 @@ from .mobject import (
     WHITE,
     YELLOW,
 )
-from .pipeline import Converter, Drawer, FrameBuffer, FrameGenerator, Renderer, render_objects_cache
+from .pipeline import Converter, Drawer, FrameBuffer, FrameGenerator, OnlineDrawer, Renderer, render_objects_cache
 from .gpu import GPUFrameGenerator
 from .object_cache import ObjectCacheReader, ObjectCacheWriter, render_config_from_cache
 from .scene import MovingCameraScene, Scene, ThreeDScene
